@@ -1,3 +1,15 @@
+/**
+ * AutoMangaUpdate v0.2.2 変更履歴:
+ * - DL失敗時に適合するRapidgatorリンク（[Novel]除外・巻数照合）を自動でバックグラウンド待機キューへ登録
+ * - WAIT間隔設定（5秒〜30分）対応の順次ワーカー＆ファイル存在/404事前確認API（/api/rapidgator/check-status）を追加
+ * - Real-Debrid設定時はWAIT後に自動DL・保存、無料DL時はGoogle reCAPTCHA認証用の「Rapidgatorを開く」「DL完了して次へ」に対応
+ * - Rapidgator待機キューリストUIを追加（状態/WAIT残り秒数表示、一時停止/再開、個別キャンセル、表示を消す、一括削除）
+ *
+ * AutoMangaUpdate v0.2.1 変更履歴:
+ * - アーカイブ(.cbz/.zip/.rar/.cbr)が無い末端フォルダをフォルダ名整形ルール(先頭かな+空白除去・末尾連番範囲除去)で最大巻数0として登録対応
+ * - ローカルファイル名パース時の全角数字・記号正規化(NFKC)対応および欠巻(途中の抜け巻)の検出・ダウンロード対応
+ * - DLファイル名を「dl-raw.si抽出タイトル(@COMIC/媒体表記・raw・巻数除去) 第XX巻(2桁以上).元の拡張子」へ統一、[Novel]記事の検索除外強化
+ */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   FolderScanner 
@@ -48,8 +60,10 @@ import {
   CrawlSettings,
   CrawlLog,
   DownloadLogEntry,
-  ScannedFolderRecord
+  ScannedFolderRecord,
+  RapidgatorQueueItem
 } from './types';
+import { RapidgatorQueuePanel } from './components/RapidgatorQueuePanel';
 import { 
   pickAndScanMangaDirectory, 
   scanDirectoryWithFolders,
@@ -79,7 +93,7 @@ import {
   buildFullDisplayPath,
   findBestTargetFolder,
 } from './utils/folderMemory';
-import { parseMangaFilename, cleanFolderName } from './utils/mangaParser';
+import { parseMangaFilename, cleanFolderName, extractDlRawDisplayTitle } from './utils/mangaParser';
 import { 
   FolderSync, 
   Settings, 
@@ -179,6 +193,63 @@ export default function App() {
 
   const batchAbortRef = useRef<boolean>(false);
 
+  // Rapidgator 失敗コンテンツ用バックグラウンド待機キュー
+  const [rapidgatorQueue, setRapidgatorQueue] = useState<RapidgatorQueueItem[]>(() => {
+    try {
+      const raw = localStorage.getItem('automanga_rg_queue_v1');
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((q: RapidgatorQueueItem) =>
+        q.status === 'waiting' || q.status === 'downloading'
+          ? { ...q, status: 'queued', statusMessage: '待機中（リロード後に再開準備）' }
+          : q
+      );
+    } catch {
+      return [];
+    }
+  });
+  const [rgWaitSeconds, setRgWaitSeconds] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem('automanga_rg_wait_sec'));
+      return !isNaN(saved) && saved >= 0 ? saved : 35;
+    } catch {
+      return 35;
+    }
+  });
+  const [isRgQueuePaused, setIsRgQueuePaused] = useState<boolean>(false);
+  const [rgQueueTick, setRgQueueTick] = useState<number>(0);
+
+  const isRgQueuePausedRef = useRef<boolean>(false);
+  const rgWaitSecondsRef = useRef<number>(rgWaitSeconds);
+  const rapidgatorQueueRef = useRef<RapidgatorQueueItem[]>(rapidgatorQueue);
+  const rgCancelledIdsRef = useRef<Set<string>>(new Set());
+  const rgRemovedIdsRef = useRef<Set<string>>(new Set());
+  const rgWorkerRunningRef = useRef<boolean>(false);
+
+  const itemsRef = useRef<LocalMangaItem[]>(items);
+  const rememberedFoldersRef = useRef<ScannedFolderRecord[]>(rememberedFolders);
+  const rootDirectoryHandleRef = useRef<any>(rootDirectoryHandle);
+  const settingsRef = useRef<AppSettings>(settings);
+  const currentPathRef = useRef<string>(currentPath);
+  const rememberedRootNameRef = useRef<string>(rememberedRootName);
+
+  useEffect(() => { isRgQueuePausedRef.current = isRgQueuePaused; }, [isRgQueuePaused]);
+  useEffect(() => {
+    rgWaitSecondsRef.current = rgWaitSeconds;
+    try { localStorage.setItem('automanga_rg_wait_sec', String(rgWaitSeconds)); } catch {}
+  }, [rgWaitSeconds]);
+  useEffect(() => {
+    rapidgatorQueueRef.current = rapidgatorQueue;
+    try { localStorage.setItem('automanga_rg_queue_v1', JSON.stringify(rapidgatorQueue.slice(0, 100))); } catch {}
+  }, [rapidgatorQueue]);
+  useEffect(() => { itemsRef.current = items; }, [items]);
+  useEffect(() => { rememberedFoldersRef.current = rememberedFolders; }, [rememberedFolders]);
+  useEffect(() => { rootDirectoryHandleRef.current = rootDirectoryHandle; }, [rootDirectoryHandle]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+  useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
+  useEffect(() => { rememberedRootNameRef.current = rememberedRootName; }, [rememberedRootName]);
+
   // 2パス分割ダウンロード進行状況（1冊ごとに .rar を個別保存）
   const [streamProgress, setStreamProgress] = useState<{
     isActive: boolean;
@@ -213,6 +284,7 @@ export default function App() {
       label: string;
       reason: string;
     }>;
+    rgQueuedCount?: number;
     errorMessage?: string;
   }>({
     isActive: false,
@@ -228,6 +300,7 @@ export default function App() {
     directSaveNote: undefined,
     completedList: [],
     errors: [],
+    rgQueuedCount: 0,
   });
 
   const closeStreamProgressModal = () => {
@@ -249,6 +322,376 @@ export default function App() {
     setToastMessage({ message, type });
     setTimeout(() => setToastMessage(null), 4000);
   };
+
+  // Rapidgator 適合タイトル＆巻数判定ヘルパー
+  const isRapidgatorCandidateMatching = (
+    item: LocalMangaItem,
+    vol: NewVolumeInfo,
+    rgUrl: string
+  ): boolean => {
+    if (!rgUrl || !/^https?:\/\/([^/]*\.)?rapidgator\.net\//i.test(rgUrl) || rgUrl.includes('/sim/')) {
+      return false;
+    }
+    let decodedUrl = rgUrl;
+    try { decodedUrl = decodeURIComponent(rgUrl); } catch {}
+    const combinedText = `${vol.title || ''} ${vol.cleanTitle || ''} ${decodedUrl}`.normalize('NFKC');
+    if (/novel/i.test(combinedText)) return false;
+
+    // URLファイル名に明示的な巻数表記がある場合、対象巻数と一致するか確認
+    const rangeM = decodedUrl.match(/(?:v|vol\.?|第)\s*0*(\d+)\s*[-〜~–—]\s*(?:v|vol\.?|第)?\s*0*(\d+)/i);
+    if (rangeM) {
+      const s = parseInt(rangeM[1], 10);
+      const e = parseInt(rangeM[2], 10);
+      if (vol.volume < s || vol.volume > e) return false;
+    } else {
+      const singleM = decodedUrl.match(/(?:第\s*0*(\d+)\s*巻|(?<![a-z0-9])v(?:ol\.?)?\s*0*(\d+)(?![0-9]))/i);
+      if (singleM) {
+        const urlVol = parseInt(singleM[1] || singleM[2], 10);
+        if (urlVol > 0 && urlVol !== vol.volume) return false;
+      }
+    }
+
+    return Boolean(item.mangaTitle || vol.cleanTitle || vol.title);
+  };
+
+  const enqueueRapidgatorRetry = (
+    item: LocalMangaItem,
+    vol: NewVolumeInfo,
+    resolvedDownloadTitle: string,
+    targetFileName: string,
+    subFolderPath: string,
+    rgUrl: string,
+    originalError: string
+  ): boolean => {
+    if (!isRapidgatorCandidateMatching(item, vol, rgUrl)) return false;
+
+    const isSameActive = (q: RapidgatorQueueItem) =>
+      q.rapidgatorUrl === rgUrl &&
+      q.volume === vol.volume &&
+      (q.status === 'queued' || q.status === 'waiting' || q.status === 'downloading' || q.status === 'captcha_required');
+
+    if (rapidgatorQueueRef.current.some(isSameActive)) {
+      return false;
+    }
+
+    const nowIso = new Date().toISOString();
+    const entry: RapidgatorQueueItem = {
+      id: `rg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      itemId: item.id,
+      mangaTitle: item.mangaTitle,
+      dlRawTitle: resolvedDownloadTitle,
+      volume: vol.volume,
+      targetFileName,
+      rapidgatorUrl: rgUrl,
+      subFolderPath,
+      originalError,
+      status: 'queued',
+      waitTotalSec: rgWaitSecondsRef.current,
+      waitRemainingSec: rgWaitSecondsRef.current,
+      statusMessage: '順番待ち中（前の処理の完了後にWAIT開始）',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    rapidgatorQueueRef.current = [...rapidgatorQueueRef.current, entry];
+    setRapidgatorQueue((prev) => (prev.some(isSameActive) ? prev : [...prev, entry]));
+    return true;
+  };
+
+  const handleCancelRgQueueItem = (id: string) => {
+    rgCancelledIdsRef.current.add(id);
+    setRapidgatorQueue((prev) =>
+      prev.map((q) =>
+        q.id === id
+          ? {
+              ...q,
+              status: 'cancelled',
+              statusMessage: 'ユーザーによりキャンセルされました',
+              updatedAt: new Date().toISOString(),
+            }
+          : q
+      )
+    );
+    setRgQueueTick((t) => t + 1);
+  };
+
+  const handleRemoveRgQueueItem = (id: string) => {
+    rgCancelledIdsRef.current.add(id);
+    rgRemovedIdsRef.current.add(id);
+    setRapidgatorQueue((prev) => prev.filter((q) => q.id !== id));
+    setRgQueueTick((t) => t + 1);
+  };
+
+  const handleCompleteManualRgCaptcha = (id: string) => {
+    setRapidgatorQueue((prev) =>
+      prev.map((q) =>
+        q.id === id
+          ? {
+              ...q,
+              status: 'completed',
+              statusMessage: '手動CAPTCHA・ブラウザDL完了として処理しました',
+              updatedAt: new Date().toISOString(),
+            }
+          : q
+      )
+    );
+    setRgQueueTick((t) => t + 1);
+  };
+
+  const handleClearFinishedRgQueue = () => {
+    setRapidgatorQueue((prev) => {
+      const kept: RapidgatorQueueItem[] = [];
+      for (const q of prev) {
+        if (q.status === 'completed' || q.status === 'cancelled' || q.status === 'failed') {
+          rgRemovedIdsRef.current.add(q.id);
+        } else {
+          kept.push(q);
+        }
+      }
+      return kept;
+    });
+  };
+
+  const handleClearAllRgQueue = () => {
+    setRapidgatorQueue((prev) => {
+      for (const q of prev) {
+        rgCancelledIdsRef.current.add(q.id);
+        rgRemovedIdsRef.current.add(q.id);
+      }
+      return [];
+    });
+  };
+
+  // バックグラウンドキューワーカー
+  const processRapidgatorQueueItem = useCallback(async (target: RapidgatorQueueItem) => {
+    rgWorkerRunningRef.current = true;
+    const updateEntry = (patch: Partial<RapidgatorQueueItem>) => {
+      if (rgRemovedIdsRef.current.has(target.id)) return;
+      setRapidgatorQueue((prev) =>
+        prev.map((q) =>
+          q.id === target.id && !rgCancelledIdsRef.current.has(target.id)
+            ? { ...q, ...patch, updatedAt: new Date().toISOString() }
+            : q
+        )
+      );
+    };
+
+    try {
+      const totalWait = Math.max(0, rgWaitSecondsRef.current);
+      let remaining = totalWait;
+      updateEntry({
+        status: 'waiting',
+        waitTotalSec: totalWait,
+        waitRemainingSec: remaining,
+        statusMessage: `Rapidgator WAIT待機中... (残り ${remaining}秒)`,
+      });
+
+      while (remaining > 0) {
+        if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) {
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+        if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) {
+          return;
+        }
+        if (isRgQueuePausedRef.current) {
+          updateEntry({ statusMessage: `一時停止中 (WAIT残り ${remaining}秒)` });
+          continue;
+        }
+        remaining--;
+        updateEntry({
+          status: 'waiting',
+          waitRemainingSec: remaining,
+          statusMessage: `Rapidgator WAIT待機中... (残り ${remaining}秒)`,
+        });
+      }
+
+      if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) {
+        return;
+      }
+
+      // 1. Rapidgator側のファイル生存確認 (404検出)
+      updateEntry({
+        statusMessage: 'Rapidgator上のファイル存在・サイズを確認中...',
+      });
+      const checkRes = await fetch('/api/rapidgator/check-status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: target.rapidgatorUrl }),
+      });
+      const checkData = await checkRes.json().catch(() => ({}));
+      if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) {
+        return;
+      }
+      if (checkData.success && checkData.exists === false) {
+        updateEntry({
+          status: 'failed',
+          statusMessage: checkData.error || 'Rapidgator側でもファイルが存在しませんでした (404)',
+        });
+        return;
+      }
+
+      const activeSettings = settingsRef.current;
+      const fileSizeText = checkData.fileSizeText;
+
+      // 2. Real-Debrid APIキーが設定されている場合はバックグラウンドで完全自動DL
+      if (activeSettings.debridApiKey && activeSettings.debridApiKey.trim()) {
+        const effectiveFormat =
+          activeSettings.downloadFormat === 'zip' || activeSettings.downloadFormat === 'cbz'
+            ? activeSettings.downloadFormat
+            : 'rar';
+
+        updateEntry({
+          status: 'downloading',
+          progressPercent: 0,
+          rapidgatorFileSize: fileSizeText,
+          statusMessage: 'Real-Debrid経由でRapidgatorからバックグラウンド取得中...',
+        });
+
+        const p1 = await downloadPass1ToWebAppCache(
+          {
+            title: target.dlRawTitle,
+            volume: target.volume,
+            downloadUrl: target.rapidgatorUrl,
+            format: effectiveFormat,
+            debridApiKey: activeSettings.debridApiKey,
+          },
+          (info) => {
+            if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) return;
+            updateEntry({
+              status: 'downloading',
+              progressPercent: Math.min(90, Math.round((info.percent || 0) * 0.9)),
+              statusMessage:
+                info.status === 'resolving'
+                  ? 'Real-DebridでRapidgator直リンクを解決中...'
+                  : `取得中 (${(info.downloadedBytes / (1024 * 1024)).toFixed(1)}MB ・ ${info.speedMb}MB/s)`,
+            });
+          }
+        );
+
+        if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) {
+          await releaseWebAppCacheJob(p1.jobId);
+          return;
+        }
+
+        // 記憶フォルダがあれば直接保存先を解決
+        let targetDirHandle: any = null;
+        const activeRootHandle = rootDirectoryHandleRef.current;
+        if (activeRootHandle && activeSettings.autoSaveToFolder) {
+          const matchedItem = itemsRef.current.find((i) => i.id === target.itemId);
+          const optimalFolder = findBestTargetFolder({
+            mangaTitle: target.mangaTitle,
+            item: matchedItem,
+            scannedItems: itemsRef.current,
+            rememberedFolders: rememberedFoldersRef.current,
+            rootName: rememberedRootNameRef.current || activeRootHandle?.name || 'Manga',
+            rootDisplayPath: currentPathRef.current,
+          });
+          if (optimalFolder.directoryHandle) {
+            try {
+              const perm = await optimalFolder.directoryHandle.queryPermission?.({ mode: 'readwrite' });
+              if (perm === 'granted') targetDirHandle = optimalFolder.directoryHandle;
+            } catch {}
+          }
+          if (!targetDirHandle && (optimalFolder.subFolderPath || target.subFolderPath)) {
+            targetDirHandle = await resolveOrCreateSubfolder(
+              activeRootHandle,
+              optimalFolder.subFolderPath || target.subFolderPath
+            );
+          }
+        }
+
+        const pass2 = await downloadPass2ToBrowser(
+          p1.cachedUrl,
+          p1.fileName,
+          {
+            autoTriggerBrowserDownload: true,
+            isSim: p1.isSim,
+            targetDirHandle,
+            autoRevokeDelayMs: 10000,
+          }
+        );
+        await releaseWebAppCacheJob(p1.jobId);
+
+        if (rgCancelledIdsRef.current.has(target.id) || rgRemovedIdsRef.current.has(target.id)) {
+          return;
+        }
+
+        setItems((prev) => {
+          const updated = prev.map((i): LocalMangaItem => {
+            if (i.id !== target.itemId) return i;
+            const updatedOwned = Array.from(new Set([...i.ownedVolumes, target.volume])).sort((a, b) => a - b);
+            const remainingNew = i.availableNewVolumes.filter((v) => v.volume !== target.volume);
+            return {
+              ...i,
+              ownedVolumes: updatedOwned,
+              maxVolume: Math.max(i.maxVolume, target.volume),
+              availableNewVolumes: remainingNew,
+              status: remainingNew.length > 0 ? 'has_updates' : 'up_to_date',
+              files: [...i.files, { name: pass2.fileName, volume: target.volume, size: pass2.size }],
+            };
+          });
+          saveRememberedScannedItems(updated);
+          return updated;
+        });
+
+        addDownloadLog({
+          id: `rg-done-${Date.now()}-${target.volume}`,
+          timestamp: new Date().toLocaleTimeString(),
+          title: target.dlRawTitle,
+          volume: target.volume,
+          fileName: pass2.fileName,
+          size: pass2.size,
+          status: 'success',
+          savedToPcFolder: pass2.savedToPcFolder,
+          destination: pass2.savedToPcFolder
+            ? buildFullDisplayPath(currentPathRef.current, target.subFolderPath, pass2.fileName)
+            : 'ブラウザのダウンロードフォルダ',
+          message: `Rapidgatorバックグラウンドキューから保存完了 (${(pass2.size / (1024 * 1024)).toFixed(1)}MB)`,
+          downloadUrl: target.rapidgatorUrl,
+        });
+
+        updateEntry({
+          status: 'completed',
+          progressPercent: 100,
+          targetFileName: pass2.fileName,
+          statusMessage: pass2.savedToPcFolder
+            ? `保存完了 (${target.subFolderPath}/${pass2.fileName})`
+            : `ブラウザ保存完了 (${pass2.fileName})`,
+        });
+        showToast(`Rapidgatorキュー完了: ${pass2.fileName}`, 'success');
+      } else {
+        // 3. Real-Debrid未設定時はGoogle reCAPTCHA認証が必須なため認証待ちへ移行
+        updateEntry({
+          status: 'captcha_required',
+          rapidgatorFileSize: fileSizeText,
+          statusMessage: `Rapidgator側ファイル存在確認済${fileSizeText ? ` (${fileSizeText})` : ''}。無料DLはreCAPTCHA認証が必要なため「Rapidgatorを開く」からDL後、「DL完了して次へ」を押してください。`,
+        });
+      }
+    } catch (err: any) {
+      if (!rgCancelledIdsRef.current.has(target.id) && !rgRemovedIdsRef.current.has(target.id)) {
+        updateEntry({
+          status: 'failed',
+          statusMessage: `Rapidgator DL失敗: ${err?.message || '不明なエラー'}`,
+        });
+      }
+    } finally {
+      rgWorkerRunningRef.current = false;
+      setRgQueueTick((t) => t + 1);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isRgQueuePaused || rgWorkerRunningRef.current) return;
+    const hasBlocking = rapidgatorQueue.some(
+      (q) => q.status === 'waiting' || q.status === 'downloading' || q.status === 'captcha_required'
+    );
+    if (hasBlocking) return;
+    const nextQueued = rapidgatorQueue.find((q) => q.status === 'queued');
+    if (nextQueued) {
+      void processRapidgatorQueueItem(nextQueued);
+    }
+  }, [rapidgatorQueue, isRgQueuePaused, rgQueueTick, processRapidgatorQueueItem]);
 
   // ----------------------------------------------------
   // クローラー状態取得 & SSE 購読 (添付コード完全連携)
@@ -562,6 +1005,7 @@ export default function App() {
     // 2. ファイルを走査してマンガタイトル・巻数・フォルダ構造を高精度解析
     const map = new Map<string, LocalMangaItem>();
     const folderMap = new Map<string, ScannedFolderRecord>();
+    const parentSubPaths = new Set<string>();
 
     fileList.forEach((f) => {
       const parts = f.webkitRelativePath ? f.webkitRelativePath.split('/') : [f.name];
@@ -571,10 +1015,14 @@ export default function App() {
       const folderTitle = relParts.length > 0 ? relParts[relParts.length - 1] : (parts.length > 1 ? parts[0] : 'Unknown');
       const category = relParts.length > 1 ? relParts[0] : (detectedRootName || 'default');
 
+      for (let idx = 1; idx < relParts.length; idx++) {
+        parentSubPaths.add(relParts.slice(0, idx).join('/'));
+      }
+
       if (subPath && !folderMap.has(subPath)) {
         folderMap.set(subPath, {
           folderName: folderTitle,
-          mangaTitle: cleanFolderName(folderTitle),
+          mangaTitle: cleanFolderName(folderTitle) || folderTitle.trim(),
           categoryFolder: category,
           subFolderPath: subPath,
         });
@@ -616,11 +1064,33 @@ export default function App() {
       }
     });
 
+    // アーカイブが無い末端フォルダもフォルダ名から作品登録 (maxVolume = 0)
+    for (const [subPath, rec] of folderMap.entries()) {
+      if (parentSubPaths.has(subPath)) continue;
+      if (rec.folderName.startsWith('.')) continue;
+      const key = `${rec.categoryFolder}:::${rec.folderName}`;
+      if (!map.has(key)) {
+        map.set(key, {
+          id: key,
+          folderName: rec.folderName,
+          mangaTitle: rec.mangaTitle || rec.folderName.trim(),
+          categoryFolder: rec.categoryFolder,
+          subFolderPath: subPath,
+          ownedVolumes: [],
+          maxVolume: 0,
+          files: [],
+          status: 'idle',
+          availableNewVolumes: [],
+        });
+      }
+    }
+
     const parsedList = Array.from(map.values()).map((item) => {
       item.ownedVolumes.sort((a, b) => a - b);
       item.files.sort((a, b) => a.volume - b.volume);
       return item;
     });
+    parsedList.sort((a, b) => a.mangaTitle.localeCompare(b.mangaTitle, 'ja'));
     const scannedFolders = Array.from(folderMap.values());
 
     setItems(parsedList);
@@ -656,6 +1126,7 @@ export default function App() {
         body: JSON.stringify({
           keyword: targetItem.mangaTitle,
           currentMaxVol: targetItem.maxVolume,
+          ownedVolumes: targetItem.ownedVolumes,
           preferredHost: settings.preferredHost,
           searchSource: settings.searchSource,
           allowSimulation: settings.mockSimulationFallback,
@@ -705,7 +1176,7 @@ export default function App() {
       );
 
       if (found.length > 0) {
-        showToast(`${targetItem.mangaTitle}: 新刊 (第${found.map((v) => v.volume).join(', ')}巻) が見つかりました！`, 'success');
+        showToast(`${targetItem.mangaTitle}: 新刊・未所持巻 (第${found.map((v) => v.volume).join(', ')}巻) が見つかりました！`, 'success');
       } else {
         showToast(`${targetItem.mangaTitle}: 最新巻まで所持しています`, 'info');
       }
@@ -748,6 +1219,7 @@ export default function App() {
           body: JSON.stringify({
             keyword: item.mangaTitle,
             currentMaxVol: item.maxVolume,
+            ownedVolumes: item.ownedVolumes,
             preferredHost: settings.preferredHost,
             searchSource: settings.searchSource,
             allowSimulation: settings.mockSimulationFallback,
@@ -828,7 +1300,7 @@ export default function App() {
         'error'
       );
     } else {
-      showToast(`一括チェック完了: 合計 ${newReleaseCount}冊の新刊を検出しました`, 'success');
+      showToast(`一括チェック完了: 合計 ${newReleaseCount}冊の新刊・未所持巻を検出しました`, 'success');
     }
   };
 
@@ -912,6 +1384,7 @@ export default function App() {
       directSaveNote,
       completedList: [],
       errors: [],
+      rgQueuedCount: 0,
     });
 
     let overallIndex = 0;
@@ -931,6 +1404,7 @@ export default function App() {
       saveFallbackReason?: string;
     }> = [];
     const errors: Array<{ label: string; reason: string }> = [];
+    let rgQueuedCount = 0;
 
     for (const { item, volumes } of targetItems) {
       if (batchAbortRef.current) break;
@@ -975,7 +1449,11 @@ export default function App() {
         if (batchAbortRef.current) break;
 
         const volNum = vol.volume;
-        const initialFileName = `${item.mangaTitle} 第${String(volNum).padStart(2, '0')}巻.${effectiveFormat}`;
+        const resolvedDownloadTitle =
+          (vol.cleanTitle && vol.cleanTitle.trim()) ||
+          (vol.title ? extractDlRawDisplayTitle(vol.title, item.mangaTitle) : '') ||
+          item.mangaTitle;
+        const initialFileName = `${resolvedDownloadTitle} 第${String(volNum).padStart(2, '0')}巻.${effectiveFormat}`;
         const logId = `dl-${Date.now()}-${overallIndex}-${volNum}`;
         const preferredLink =
           settings.preferredHost !== 'all'
@@ -992,7 +1470,7 @@ export default function App() {
         addDownloadLog({
           id: logId,
           timestamp: new Date().toLocaleTimeString(),
-          title: item.mangaTitle,
+          title: resolvedDownloadTitle,
           volume: volNum,
           fileName: initialFileName,
           status: 'downloading',
@@ -1008,7 +1486,7 @@ export default function App() {
           ...prev,
           status: 'downloading',
           phase: 'pass1',
-          currentTitle: item.mangaTitle,
+          currentTitle: resolvedDownloadTitle,
           currentVolume: volNum,
           currentIndex: overallIndex,
           receivedBytes: 0,
@@ -1021,7 +1499,7 @@ export default function App() {
           // 【Pass 1】この1冊の原本をWebアプリ内キャッシュへ取得
           const p1Result = await downloadPass1ToWebAppCache(
             {
-              title: item.mangaTitle,
+              title: resolvedDownloadTitle,
               volume: volNum,
               downloadUrl: targetDownloadUrl,
               format: effectiveFormat,
@@ -1111,6 +1589,7 @@ export default function App() {
 
           updateDownloadLog(logId, {
             status: 'success',
+            fileName: pass2Res.fileName,
             size: pass2Res.size,
             savedToPcFolder: pass2Res.savedToPcFolder,
             destination: finalDest,
@@ -1177,7 +1656,7 @@ export default function App() {
         } catch (err: any) {
           const reason = err?.message || 'ダウンロード失敗';
           console.error(`2-pass download error: ${item.mangaTitle} vol ${volNum}:`, err);
-          errors.push({ label: `${item.mangaTitle} 第${volNum}巻`, reason });
+          errors.push({ label: `${resolvedDownloadTitle} 第${volNum}巻`, reason });
           updateDownloadLog(logId, {
             status: 'failed',
             error: reason,
@@ -1187,6 +1666,32 @@ export default function App() {
             ...prev,
             errors: [...errors],
           }));
+
+          // 中止でなければ、適合するRapidgatorリンクをバックグラウンド待機キューへ自動追加
+          if (!batchAbortRef.current) {
+            const rgLink =
+              vol.downloadLinks?.find((l) => l.host === 'rapidgator' && isRapidgatorCandidateMatching(item, vol, l.url)) ||
+              (vol.downloadUrl && isRapidgatorCandidateMatching(item, vol, vol.downloadUrl)
+                ? { host: 'rapidgator', url: vol.downloadUrl }
+                : undefined);
+            if (rgLink?.url) {
+              const queued = enqueueRapidgatorRetry(
+                item,
+                vol,
+                resolvedDownloadTitle,
+                initialFileName,
+                optimalFolder.subFolderPath,
+                rgLink.url,
+                reason
+              );
+              if (queued) {
+                rgQueuedCount++;
+                updateDownloadLog(logId, {
+                  message: `取得失敗 (${reason}) ➜ Rapidgator待機キューへ自動登録しました`,
+                });
+              }
+            }
+          }
         }
 
         overallIndex++;
@@ -1204,12 +1709,17 @@ export default function App() {
         status: 'error',
         aborted: wasAborted,
         errors,
+        rgQueuedCount,
         errorMessage: combinedError,
         currentStep: wasAborted ? 'ダウンロード中止' : 'ダウンロード失敗',
       }));
       showToast(
-        wasAborted ? 'ダウンロードを中止しました' : `ダウンロード失敗: ${errors[0]?.reason || 'エラー'}`,
-        wasAborted ? 'info' : 'error'
+        wasAborted
+          ? 'ダウンロードを中止しました'
+          : rgQueuedCount > 0
+            ? `失敗分 (${rgQueuedCount}件) をRapidgator待機キューへ自動登録しました`
+            : `ダウンロード失敗: ${errors[0]?.reason || 'エラー'}`,
+        wasAborted || rgQueuedCount > 0 ? 'info' : 'error'
       );
       return;
     }
@@ -1222,6 +1732,7 @@ export default function App() {
       aborted: wasAborted,
       completedList,
       errors,
+      rgQueuedCount,
       currentStep: wasAborted
         ? `中止 (${completedList.length}冊は保存完了)`
         : savedFolderCount === completedList.length
@@ -1544,6 +2055,15 @@ export default function App() {
                   )}
                 </div>
 
+                {(streamProgress.rgQueuedCount || 0) > 0 && (
+                  <div className="bg-cyan-950/40 border border-cyan-500/40 rounded-xl p-3 text-xs text-cyan-200 leading-relaxed">
+                    <span className="font-bold text-cyan-300">
+                      Rapidgator 待機キューへ {streamProgress.rgQueuedCount}件 自動登録しました：
+                    </span>
+                    画面下部の「Rapidgator バックグラウンド待機キュー」でWAITカウントダウンが自動進行します。
+                  </div>
+                )}
+
                 <div className="text-[11px] text-slate-400 bg-slate-950/70 border border-slate-800 rounded-lg p-2.5 leading-relaxed">
                   外部アップローダー（Leechtop / PubgFile 等）の1時間1回制限やホスト側エラーの場合、時間をおいて再試行するか、詳細モーダルから別リンク（Rapidgator / Katfile 等）や設定のDebridキーをご確認下さい。
                 </div>
@@ -1618,6 +2138,11 @@ export default function App() {
                         ・{err.label}: {err.reason}
                       </div>
                     ))}
+                    {(streamProgress.rgQueuedCount || 0) > 0 && (
+                      <div className="text-[11px] text-cyan-300 font-semibold pt-1 border-t border-amber-500/20">
+                        ➜ 適合する {streamProgress.rgQueuedCount}件を「Rapidgator バックグラウンド待機キュー」へ登録しました。
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1705,7 +2230,7 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <h1 className="font-bold text-base text-white tracking-tight">AutoMangaUpdate2</h1>
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                  v0.2.0
+                  v0.2.2
                 </span>
                 <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
                   DL-RAW.SI 連携版
@@ -1880,6 +2405,21 @@ export default function App() {
               onCheckSingle={handleCheckSingle}
               onDownloadNewVolume={(item, vol) => handleDownloadAndSaveToFolder(item, [vol])}
               onOpenVolumeModal={(item) => setSelectedMangaForModal(item)}
+            />
+
+            {/* Rapidgator 失敗コンテンツ待機キュー */}
+            <RapidgatorQueuePanel
+              queue={rapidgatorQueue}
+              waitSeconds={rgWaitSeconds}
+              isPaused={isRgQueuePaused}
+              hasDebridKey={Boolean(settings.debridApiKey && settings.debridApiKey.trim())}
+              onChangeWaitSeconds={(sec) => setRgWaitSeconds(sec)}
+              onTogglePause={() => setIsRgQueuePaused((p) => !p)}
+              onCancelItem={handleCancelRgQueueItem}
+              onRemoveItem={handleRemoveRgQueueItem}
+              onCompleteManualCaptcha={handleCompleteManualRgCaptcha}
+              onClearFinished={handleClearFinishedRgQueue}
+              onClearAll={handleClearAllRgQueue}
             />
 
             {/* ダウンロード実行ログ＆成否・エラー追跡 */}

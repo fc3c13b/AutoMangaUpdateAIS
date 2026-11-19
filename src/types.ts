@@ -144,6 +144,7 @@ export interface DownloadLink {
 export interface NewVolumeInfo {
   volume: number;
   title: string;
+  cleanTitle?: string;
   articleUrl?: string; // 記事詳細ページのURL
   downloadUrl?: string; // 選択中の代表DLリンク
   downloadLinks?: DownloadLink[]; // 記事内から抽出された全DL用リンク (Katfile, Rapidgator等)
@@ -198,5 +199,35 @@ export interface RememberedFolderState {
   scannedAt: string;
   scannedFolders: ScannedFolderRecord[];
 }
+
+export type RapidgatorQueueStatus =
+  | 'queued'
+  | 'waiting'
+  | 'downloading'
+  | 'captcha_required'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+export interface RapidgatorQueueItem {
+  id: string;
+  itemId: string;
+  mangaTitle: string;
+  dlRawTitle: string;
+  volume: number;
+  targetFileName: string;
+  rapidgatorUrl: string;
+  subFolderPath: string;
+  originalError: string;
+  status: RapidgatorQueueStatus;
+  waitTotalSec: number;
+  waitRemainingSec: number;
+  progressPercent?: number;
+  statusMessage: string;
+  rapidgatorFileSize?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 
 

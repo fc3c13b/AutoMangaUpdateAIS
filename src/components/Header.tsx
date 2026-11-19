@@ -32,7 +32,7 @@ export const Header: React.FC<HeaderProps> = ({
                 AutoMangaUpdate2
               </h1>
               <span className="text-[10px] uppercase font-semibold px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                v0.2.0
+                v0.2.2
               </span>
             </div>
             <p className="text-xs text-slate-400 hidden sm:block">

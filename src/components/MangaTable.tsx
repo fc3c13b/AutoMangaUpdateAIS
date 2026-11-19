@@ -142,6 +142,14 @@ export const MangaTable: React.FC<MangaTableProps> = ({
             const hasNewVolumes = item.availableNewVolumes.length > 0;
             const isChecking = item.status === 'checking';
             const isExpanded = expandedId === item.id;
+            const ownedSet = new Set(item.ownedVolumes);
+            const missingVolumes: number[] = [];
+            if (item.ownedVolumes.length > 0 && item.maxVolume > 1) {
+              for (let v = 1; v < Math.floor(item.maxVolume); v++) {
+                if (!ownedSet.has(v)) missingVolumes.push(v);
+              }
+            }
+            const hasGap = missingVolumes.length > 0;
 
             return (
               <div key={item.id} className="p-4 sm:p-5 hover:bg-slate-850/50 transition">
@@ -175,6 +183,14 @@ export const MangaTable: React.FC<MangaTableProps> = ({
                         <span className="text-emerald-400 font-medium">
                           現在の最大: <span className="text-sm font-bold text-emerald-300">第{item.maxVolume}巻</span>
                         </span>
+                        {hasGap && (
+                          <>
+                            <span className="text-slate-600">|</span>
+                            <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
+                              欠巻: {missingVolumes.join(', ')}巻
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -186,14 +202,20 @@ export const MangaTable: React.FC<MangaTableProps> = ({
                       <div className="flex items-center gap-2">
                         <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 text-xs font-bold animate-pulse">
                           <Sparkles className="w-3.5 h-3.5" />
-                          新刊 {item.availableNewVolumes.length}冊 検出
+                          {item.availableNewVolumes.some((nv) => nv.volume < item.maxVolume)
+                            ? `未所持 ${item.availableNewVolumes.length}冊 検出`
+                            : `新刊 ${item.availableNewVolumes.length}冊 検出`}
                         </span>
                         <button
                           onClick={() => onOpenVolumeModal(item)}
                           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-md shadow-emerald-600/20 transition"
                         >
                           <HardDriveDownload className="w-3.5 h-3.5" />
-                          <span>新刊をダウンロード</span>
+                          <span>
+                            {item.availableNewVolumes.some((nv) => nv.volume < item.maxVolume)
+                              ? '未所持巻をダウンロード'
+                              : '新刊をダウンロード'}
+                          </span>
                         </button>
                       </div>
                     ) : (
@@ -258,14 +280,16 @@ export const MangaTable: React.FC<MangaTableProps> = ({
                 {hasNewVolumes && (
                   <div className="mt-3 p-3 rounded-xl bg-amber-950/30 border border-amber-600/30 flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-semibold text-amber-300">新刊候補:</span>
+                      <span className="text-xs font-semibold text-amber-300">
+                        {item.availableNewVolumes.some((nv) => nv.volume < item.maxVolume) ? '検出巻候補:' : '新刊候補:'}
+                      </span>
                       <div className="flex flex-wrap gap-1.5">
                         {item.availableNewVolumes.map((nv) => (
                           <span
                             key={nv.volume}
                             className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-200 border border-amber-500/30 text-xs font-mono font-bold"
                           >
-                            第{nv.volume}巻
+                            第{nv.volume}巻{nv.volume < item.maxVolume ? ' (欠巻)' : ''}
                           </span>
                         ))}
                       </div>

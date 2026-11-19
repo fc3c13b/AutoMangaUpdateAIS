@@ -12,6 +12,7 @@ import { createServer as createViteServer } from 'vite';
 import { scraperInstance } from './server/scraper.js';
 import { Storage } from './server/storage.js';
 import { parsePostTitle, normalizeTitle } from './src/utils/parser.js';
+import { formatDownloadedFilename, extractDlRawDisplayTitle } from './src/utils/mangaParser.js';
 import { MANGA_DATA_BASE } from './server/sampleData.js';
 
 dotenv.config();
@@ -555,10 +556,10 @@ async function startServer() {
       }
     }
 
-    // Match single volume markers like v24, v024, vol.24, 第24巻, _24.rar, 24.rar
-    const singleRegex = /(?:第\s*0*(\d+)\s*巻|(?<![a-z0-9])v(?:ol(?:ume)?)?\.?\s*0*(\d+)(?![0-9\-])|[_\s]0*(\d{1,4})(?:\s*DL)?\.(?:rar|zip|cbz|cbr))/gi;
+    // Match single volume markers like v24, v024, vol.24, 第24巻, 24巻, _24.rar, -24.rar, /24.rar
+    const singleRegex = /(?:第\s*0*(\d+)\s*巻|(?<![a-z0-9])v(?:ol(?:ume)?)?\.?\s*0*(\d+)(?![0-9\-])|[_\s\-\/\[]0*(\d{1,4})(?:\s*DL)?\.(?:rar|zip|cbz|cbr)|(?:^|[\s\[\(])0*(\d{1,3})\s*巻)/gi;
     while ((m = singleRegex.exec(combined)) !== null) {
-      const num = parseInt(m[1] || m[2] || m[3], 10);
+      const num = parseInt(m[1] || m[2] || m[3] || m[4], 10);
       if (num > 0 && num < 5000) vols.add(num);
     }
 
@@ -645,7 +646,33 @@ async function startServer() {
       ) {
         seenUrls.add(href);
         const fullUrl = href.startsWith('//') ? `https:${href}` : href;
-        const matchedVolumes = extractVolumesFromLinkHint(linkText, fullUrl);
+        let matchedVolumes = extractVolumesFromLinkHint(linkText, fullUrl);
+        if (matchedVolumes.length === 0) {
+          // 同一行の直前テキスト（例: "第04巻 : [Katfile] [Rapidgator]"）から巻数ヒントを抽出
+          let inlinePrefix = '';
+          let prevNode: any = (aEl as any).prev;
+          while (prevNode) {
+            if (prevNode.type === 'tag') {
+              const tag = (prevNode.name || '').toLowerCase();
+              if (tag === 'br' || tag === 'p' || tag === 'div' || tag === 'li' || tag === 'tr') break;
+              if (tag !== 'a') {
+                inlinePrefix = $(prevNode).text() + inlinePrefix;
+              }
+            } else if (prevNode.type === 'text') {
+              inlinePrefix = (prevNode.data || '') + inlinePrefix;
+            }
+            prevNode = prevNode.prev;
+          }
+          if (!inlinePrefix.trim()) {
+            const parentEl = $(aEl).parent();
+            if (parentEl.is('td')) {
+              inlinePrefix = parentEl.prev('td').text().trim();
+            }
+          }
+          if (inlinePrefix.trim()) {
+            matchedVolumes = extractVolumesFromLinkHint(inlinePrefix.trim(), '');
+          }
+        }
         links.push({
           host,
           url: fullUrl,
@@ -782,6 +809,7 @@ async function startServer() {
     const {
       keyword = '',
       currentMaxVol = 0,
+      ownedVolumes = [],
       preferredHost = 'all',
       searchSource = 'both',
       allowSimulation = false,
@@ -790,6 +818,21 @@ async function startServer() {
     if (!keyword || !String(keyword).trim()) {
       return res.status(400).json({ success: false, error: '検索キーワードが空です' });
     }
+
+    const ownedSet = new Set<number>(
+      Array.isArray(ownedVolumes)
+        ? ownedVolumes.map((n: any) => Number(n)).filter((n: number) => !isNaN(n) && n > 0)
+        : []
+    );
+    const missingSet = new Set<number>();
+    if (ownedSet.size > 0 && currentMaxVol > 1) {
+      for (let v = 1; v < Math.floor(currentMaxVol); v++) {
+        if (!ownedSet.has(v)) {
+          missingSet.add(v);
+        }
+      }
+    }
+    const isNeededVolume = (vol: number) => vol > currentMaxVol || missingSet.has(vol);
 
     const cleanKeyword = String(keyword).normalize('NFKC').trim();
     const { candidates, baseTitle, baseNorm, baseNormNoEdition } = buildSearchCandidates(cleanKeyword);
@@ -922,21 +965,23 @@ async function startServer() {
             ? gridArticles
             : $('article.position-relative, article.post, .posts-wrap > article, #main article, .site-main article, #content article, article');
 
-          const rawMatches: Array<{ postTitle: string; pageUrl: string }> = [];
+          const rawMatches: Array<{ postTitle: string; pageUrl: string; cardText?: string }> = [];
 
           if (articles.length > 0) {
             articles.each((_, el) => {
               const titleEl = $(el).find('h2 a, h1 a, h3 a, .entry-title a, a.stretched-link, a').first();
               const postTitle = (titleEl.attr('title') || titleEl.text() || '').trim();
               const pageUrl = (titleEl.attr('href') || '').trim();
+              const cardText = $(el).text().trim();
               if (postTitle && pageUrl && pageUrl.startsWith('http')) {
-                rawMatches.push({ postTitle, pageUrl });
+                rawMatches.push({ postTitle, pageUrl, cardText });
               }
             });
           } else {
             $('main h2 a, #main h2 a, .site-main h2 a, h2.entry-title a, h1.entry-title a').each((_, el) => {
               const postTitle = ($(el).attr('title') || $(el).text() || '').trim();
               const pageUrl = ($(el).attr('href') || '').trim();
+              const cardText = $(el).closest('article, .post, li, div').text().trim();
               if (
                 postTitle &&
                 pageUrl &&
@@ -944,7 +989,7 @@ async function startServer() {
                 !pageUrl.includes('/category/') &&
                 !pageUrl.includes('/tag/')
               ) {
-                rawMatches.push({ postTitle, pageUrl });
+                rawMatches.push({ postTitle, pageUrl, cardText });
               }
             });
           }
@@ -958,9 +1003,15 @@ async function startServer() {
 
           const qNorm = normalizeTitle(queryText);
           let matchedInThisQuery = 0;
-          for (const { postTitle, pageUrl } of rawMatches) {
-            // タイトルに Novel が含まれる記事（小説版等）は検索結果から除外
-            if (containsNovelInTitle(postTitle)) continue;
+          for (const { postTitle, pageUrl, cardText } of rawMatches) {
+            // タイトルや記事カード・URLに [Novel] / Novel が含まれる記事（小説版等）は検索結果から除外
+            if (
+              containsNovelInTitle(postTitle) ||
+              containsNovelInTitle(cardText) ||
+              containsNovelInTitle(decodeSafe(pageUrl))
+            ) {
+              continue;
+            }
 
             const parsed = parsePostTitle(postTitle);
             const pNorm = parsed.normalizedTitle;
@@ -1037,22 +1088,48 @@ async function startServer() {
         return rank(a.sourceType) - rank(b.sourceType);
       });
 
-      // 3. 最大巻数より大きい新刊のみを厳密フィルター処理 (昇順ソート)
-      const uniqueVolumeMap = new Map<number, typeof foundArticles[number]>();
+      // 3. 最大巻数より大きい新刊 ＋ 所持リストから抜けている欠巻の両方を抽出対象にする
+      const extractTitleVolumeRange = (rawTitle: string): { min: number; max: number; isRange: boolean } => {
+        const parsed = parsePostTitle(rawTitle);
+        const norm = (parsed.rawVolumeStr || rawTitle).normalize('NFKC');
+        const rangeMatch = norm.match(/(\d+)\s*[-〜~–—]\s*(?:第|vol\.?|v)?\s*(\d+)/i);
+        if (rangeMatch) {
+          const s = parseInt(rangeMatch[1], 10);
+          const e = parseInt(rangeMatch[2], 10);
+          if (s > 0 && e >= s) {
+            return { min: s, max: e, isRange: true };
+          }
+        }
+        return { min: parsed.maxVolume, max: parsed.maxVolume, isRange: false };
+      };
+
+      const uniqueArticleMap = new Map<string, typeof foundArticles[number]>();
       for (const a of prioritizedPool) {
-        if (a.volume > currentMaxVol) {
-          if (!uniqueVolumeMap.has(a.volume)) {
-            uniqueVolumeMap.set(a.volume, a);
+        const rangeInfo = extractTitleVolumeRange(a.title);
+        let coversMissing = false;
+        if (missingSet.size > 0 && rangeInfo.isRange) {
+          for (const mv of missingSet) {
+            if (mv >= rangeInfo.min && mv <= Math.max(a.volume, rangeInfo.max)) {
+              coversMissing = true;
+              break;
+            }
+          }
+        }
+        if (isNeededVolume(a.volume) || coversMissing) {
+          const dedupKey = a.articleUrl || `${a.sourceType}:${a.volume}:${a.title}`;
+          if (!uniqueArticleMap.has(dedupKey)) {
+            uniqueArticleMap.set(dedupKey, a);
           }
         }
       }
 
-      const filteredNewArticles = Array.from(uniqueVolumeMap.values()).sort((a, b) => a.volume - b.volume);
+      const filteredNewArticles = Array.from(uniqueArticleMap.values()).sort((a, b) => a.volume - b.volume);
 
-      // 4. 各新刊記事からダウンロードリンクを抽出 (記事ページ内の各巻リンクも展開)
+      // 4. 各新刊/欠巻記事からダウンロードリンクを抽出 (記事ページ内の各巻リンクも展開)
       const finalNewVolumes: Array<{
         volume: number;
         title: string;
+        cleanTitle: string;
         articleUrl: string;
         downloadUrl?: string;
         downloadLinks: Array<{ host: string; url: string; label?: string }>;
@@ -1076,17 +1153,24 @@ async function startServer() {
           continue;
         }
 
-        // まとめ記事（例: 第01-24巻）の中に currentMaxVol より大きい個別巻リンク（例: v22, v23, v24）がある場合は個別展開
-        const individualNewVols = new Set<number>();
+        // まとめ記事（例: 第01-10巻）の中に未所持巻（新刊 または 欠巻）の個別/範囲リンクがある場合はすべて展開
+        const neededVolsInArticle = new Set<number>();
         for (const l of allLinks) {
-          if (l.matchedVolumes.length === 1 && l.matchedVolumes[0] > currentMaxVol && l.matchedVolumes[0] <= item.volume) {
-            individualNewVols.add(l.matchedVolumes[0]);
+          for (const v of l.matchedVolumes) {
+            if (isNeededVolume(v) && v <= item.volume) {
+              neededVolsInArticle.add(v);
+            }
           }
         }
-        individualNewVols.add(item.volume);
+        if (isNeededVolume(item.volume)) {
+          neededVolsInArticle.add(item.volume);
+        }
 
-        const targetVolList = Array.from(individualNewVols).sort((a, b) => a - b);
-        const baseCleanTitle = parsePostTitle(item.title).cleanTitle || cleanKeyword;
+        const targetVolList = Array.from(neededVolsInArticle).sort((a, b) => a - b);
+        const dlRawCleanTitle = extractDlRawDisplayTitle(
+          item.title,
+          parsePostTitle(item.title).cleanTitle || cleanKeyword
+        );
 
         for (const targetVol of targetVolList) {
           if (seenOutputVolumes.has(targetVol)) continue;
@@ -1102,12 +1186,13 @@ async function startServer() {
             primaryUrl = volLinks[0].url;
           }
 
-          const resolvedTitle = targetVol === item.volume ? item.title : `${baseCleanTitle} 第${targetVol}巻`;
-          if (containsNovelInTitle(resolvedTitle)) continue;
+          const resolvedTitle = targetVol === item.volume ? item.title : `${dlRawCleanTitle} 第${String(targetVol).padStart(2, '0')}巻`;
+          if (containsNovelInTitle(resolvedTitle) || containsNovelInTitle(dlRawCleanTitle)) continue;
 
           finalNewVolumes.push({
             volume: targetVol,
             title: resolvedTitle,
+            cleanTitle: dlRawCleanTitle,
             articleUrl: item.articleUrl,
             downloadUrl: primaryUrl || item.articleUrl,
             downloadLinks: volLinks,
@@ -1361,6 +1446,68 @@ JDownloader2等を使用する場合は付属のURLまたはショートカッ�
   // 3. Pubg / Leechtop サーバーサイド常駐ダウンロード & 高速Rangeキャッシュ配信
   // ==========================================
 
+  // ダウンロード先サイトのヘッダー・URLから実ファイル名を抽出
+  function sanitizeServerFileName(rawName: string): string {
+    const base = path.basename(String(rawName || '').trim());
+    return base
+      .replace(/[\/\\?%*:|"<>]/g, '_')
+      .replace(/[\u0000-\u001f]/g, '')
+      .replace(/[. ]+$/, '')
+      .trim();
+  }
+
+  function extractDownloadFilename(
+    contentDisposition: unknown,
+    responseUrl?: string
+  ): string | null {
+    if (typeof contentDisposition === 'string' && contentDisposition.trim()) {
+      // RFC 5987 filename*=UTF-8''...
+      const utf8Match = contentDisposition.match(/filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\r\n]+)/i);
+      if (utf8Match && utf8Match[1]) {
+        try {
+          const decoded = sanitizeServerFileName(decodeURIComponent(utf8Match[1].replace(/^["']|["']$/g, '')));
+          if (decoded && !/^download(\.[a-z0-9]+)?$/i.test(decoded)) {
+            return decoded;
+          }
+        } catch {}
+      }
+
+      // 標準 filename="..." or filename=...
+      const stdMatch = contentDisposition.match(/filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;\r\n]+)/i);
+      const rawVal = (stdMatch?.[1] || stdMatch?.[2] || '').trim();
+      if (rawVal) {
+        let decodedVal = rawVal;
+        try {
+          if (/%[0-9A-Fa-f]{2}/.test(decodedVal)) {
+            decodedVal = decodeURIComponent(decodedVal);
+          }
+        } catch {}
+        const safe = sanitizeServerFileName(decodedVal);
+        if (safe && !/^download(\.[a-z0-9]+)?$/i.test(safe)) {
+          return safe;
+        }
+      }
+    }
+
+    if (responseUrl && /^https?:\/\//i.test(responseUrl)) {
+      try {
+        const parsed = new URL(responseUrl);
+        const lastSegment = parsed.pathname.split('/').filter(Boolean).pop() || '';
+        const decodedSeg = decodeURIComponent(lastSegment);
+        const safeSeg = sanitizeServerFileName(decodedSeg);
+        if (
+          safeSeg &&
+          /\.(rar|zip|cbz|cbr|7z|pdf)$/i.test(safeSeg) &&
+          !/^(download|file|index)\.(rar|zip|cbz|cbr|7z|pdf)$/i.test(safeSeg)
+        ) {
+          return safeSeg;
+        }
+      } catch {}
+    }
+
+    return null;
+  }
+
   // 3.1 サーバー側ダウンロードジョブ開始 (Pubg File / Leechtop 認証自動解決 & ストリーム保存)
   app.post('/api/download/server-fetch/start', async (req, res) => {
     const { url = '', fileName = '', title = 'Manga', volume = 1, format = 'rar', fastMode, debridApiKey } = req.body;
@@ -1368,7 +1515,9 @@ JDownloader2等を使用する場合は付属のURLまたはショートカッ�
     const timeoutSeconds = isFast ? 60 : 180;
     const timeoutMs = timeoutSeconds * 1000;
     const ext = (format === 'zip' || format === 'cbz') ? format : 'rar';
-    const safeFileName = (fileName || `${title} 第${String(volume).padStart(2, '0')}巻.${ext}`).replace(/[\/\\?%*:|"<>]/g, '_');
+    const rawInitialName = fileName || `${title} 第${String(volume).padStart(2, '0')}巻.${ext}`;
+    const formattedInitialName = formatDownloadedFilename(rawInitialName, title, Number(volume) || 1, ext);
+    const safeFileName = sanitizeServerFileName(formattedInitialName) || `Manga_v${volume}.${ext}`;
     const jobId = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
     const tempFilePath = path.join(DL_CACHE_DIR, `${jobId}_${safeFileName}`);
 
@@ -1445,13 +1594,24 @@ JDownloader2等を使用する場合は付属のURLまたはショートカッ�
 
       try {
         let targetDownloadUrl = url;
+        let siteOriginalFileName: string | null = null;
 
         // 1. Debrid API key unrestrict if provided
         if (debridApiKey && targetDownloadUrl && !targetDownloadUrl.includes('/sim/')) {
           const debrid = await unrestrictLink(targetDownloadUrl, debridApiKey);
           if (debrid?.downloadUrl) {
             targetDownloadUrl = debrid.downloadUrl;
-            job.logs.push(`[Server DL Debrid] アンレストリクト成功`);
+            if (debrid.filename) {
+              const safeDebridName = sanitizeServerFileName(debrid.filename);
+              if (safeDebridName) {
+                const formatted = sanitizeServerFileName(
+                  formatDownloadedFilename(safeDebridName, title, Number(volume) || 1, ext)
+                );
+                siteOriginalFileName = formatted || safeDebridName;
+                job.fileName = siteOriginalFileName;
+              }
+            }
+            job.logs.push(`[Server DL Debrid] アンレストリクト成功${siteOriginalFileName ? ` (${siteOriginalFileName})` : ''}`);
           }
         }
 
@@ -1500,6 +1660,29 @@ JDownloader2等を使用する場合は付属のURLまたはショートカッ�
             if (contentType.includes('text/html')) {
               streamRes.data?.destroy?.();
               throw new Error('外部アップローダーが原本バイナリではなくHTMLページを返しました（直接DL非対応ホストまたは認証制限）');
+            }
+
+            const finalResponseUrl = streamRes.request?.res?.responseUrl || finalUrl;
+            const extractedFromSite = extractDownloadFilename(
+              streamRes.headers['content-disposition'],
+              finalResponseUrl
+            );
+            if (extractedFromSite) {
+              const formatted = sanitizeServerFileName(
+                formatDownloadedFilename(extractedFromSite, title, Number(volume) || 1, ext)
+              );
+              siteOriginalFileName = formatted || extractedFromSite;
+              job.fileName = siteOriginalFileName;
+              job.logs.push(`[Server DL] サイト側ファイル名を採用: ${siteOriginalFileName}`);
+            } else if (!siteOriginalFileName) {
+              const fallbackFromUrl = extractDownloadFilename(undefined, targetDownloadUrl);
+              if (fallbackFromUrl) {
+                const formatted = sanitizeServerFileName(
+                  formatDownloadedFilename(fallbackFromUrl, title, Number(volume) || 1, ext)
+                );
+                siteOriginalFileName = formatted || fallbackFromUrl;
+                job.fileName = siteOriginalFileName;
+              }
             }
 
             const cl = streamRes.headers['content-length'];
@@ -1859,6 +2042,75 @@ JDownloader2等を使用する場合は付属のURLまたはショートカッ�
         success: false,
         error: err.message,
         logs,
+      });
+    }
+  });
+
+  // Rapidgator リンクの生存・ファイルサイズ事前確認 (404 / 削除済み判定)
+  app.post('/api/rapidgator/check-status', async (req, res) => {
+    const { url = '' } = req.body || {};
+    if (!url || !/^https?:\/\/([^/]*\.)?rapidgator\.net\//i.test(String(url))) {
+      return res.status(400).json({ success: false, exists: false, error: '有効なRapidgator URLではありません' });
+    }
+
+    try {
+      const rgRes = await axios.get(String(url), {
+        headers: {
+          ...DEFAULT_HEADERS,
+          Referer: 'https://dl-raw.si/',
+        },
+        timeout: 15000,
+        httpAgent: keepAliveHttpAgent,
+        httpsAgent: keepAliveHttpsAgent,
+        validateStatus: () => true,
+      });
+
+      const html = typeof rgRes.data === 'string' ? rgRes.data : '';
+      const finalUrl = String(rgRes.request?.res?.responseUrl || '');
+      const fid = html.match(/var\s+fid\s*=\s*(\d+)/)?.[1] || '';
+
+      const isNotFound =
+        rgRes.status === 404 ||
+        rgRes.status === 410 ||
+        /\/article\/premium/i.test(finalUrl) ||
+        /File not found|This file does not exist|Error 404|ファイルが見つかりません|存在しません|Файл не найден/i.test(html) ||
+        (!fid && rgRes.status === 200);
+
+      if (isNotFound) {
+        return res.json({
+          success: true,
+          exists: false,
+          statusCode: rgRes.status,
+          error: 'Rapidgator側でもファイルが削除または見つかりませんでした (404 / 無効リンク)',
+        });
+      }
+
+      if (rgRes.status >= 400) {
+        return res.status(502).json({
+          success: false,
+          exists: false,
+          statusCode: rgRes.status,
+          error: `Rapidgator応答エラー (HTTP ${rgRes.status})`,
+        });
+      }
+
+      const titleMatch = html.match(/<title>\s*(?:Download file|ファイルダウンロード)\s+([^<]+)<\/title>/i);
+      const sizeMatch = html.match(/(?:File size|ファイルサイズ)\s*[:：]\s*<strong>([^<]+)<\/strong>/i);
+
+      return res.json({
+        success: true,
+        exists: true,
+        statusCode: rgRes.status,
+        fid,
+        fileName: titleMatch ? titleMatch[1].trim() : undefined,
+        fileSizeText: sizeMatch ? sizeMatch[1].trim() : undefined,
+        requiresCaptcha: true,
+      });
+    } catch (err: any) {
+      return res.status(502).json({
+        success: false,
+        exists: false,
+        error: err.message || 'Rapidgatorへの接続に失敗しました',
       });
     }
   });

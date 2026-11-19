@@ -1,5 +1,5 @@
 import { LocalMangaItem, MangaFile, ScannedFolderRecord } from '../types';
-import { parseMangaFilename, cleanFolderName } from './mangaParser';
+import { parseMangaFilename, cleanFolderName, formatDownloadedFilename } from './mangaParser';
 
 export interface FileSystemAccessStatus {
   supported: boolean;
@@ -152,14 +152,22 @@ export async function scanDirectoryWithFolders(
       }
     }
 
+    let hasSubDirectory = false;
+    let hasArchiveFile = false;
+
     // @ts-ignore
     for await (const [name, handle] of currentHandle.entries()) {
       if (handle.kind === 'directory') {
+        if (name.startsWith('.') || name === 'System Volume Information' || name === '$RECYCLE.BIN') {
+          continue;
+        }
+        hasSubDirectory = true;
         // 次の階層へ
         await traverse(handle, [...pathParts, name]);
       } else if (handle.kind === 'file') {
         const isMangaFile = /\.(cbz|zip|rar|cbr)$/i.test(name);
         if (!isMangaFile) continue;
+        hasArchiveFile = true;
 
         // 階層情報
         // pathParts: 例 ['manga 1st', 'ONE PIECE'] または ['ONE PIECE']
@@ -216,6 +224,29 @@ export async function scanDirectoryWithFolders(
             item.mangaTitle = parsedTitle;
           }
         }
+      }
+    }
+
+    // 末端の作品フォルダにアーカイブ (.cbz/.zip/.rar/.cbr) が無い場合はフォルダ名からタイトル登録（最大巻数=0）
+    if (pathParts.length > 0 && !hasSubDirectory && !hasArchiveFile) {
+      const category = pathParts.length > 1 ? pathParts[0] : 'default';
+      const folderTitle = pathParts[pathParts.length - 1];
+      const key = `${category}:::${folderTitle}`;
+      if (!mangaItemsMap.has(key)) {
+        const cleanedTitle = cleanFolderName(folderTitle) || folderTitle.trim();
+        mangaItemsMap.set(key, {
+          id: key,
+          folderName: folderTitle,
+          mangaTitle: cleanedTitle,
+          categoryFolder: category,
+          subFolderPath: pathParts.join('/'),
+          ownedVolumes: [],
+          maxVolume: 0,
+          files: [],
+          directoryHandle: currentHandle,
+          status: 'idle',
+          availableNewVolumes: [],
+        });
       }
     }
   }
@@ -522,6 +553,7 @@ export async function downloadPass1ToWebAppCache(
   const pollStart = Date.now();
   let completed = false;
   let finalBytes = 0;
+  let resolvedFileName = finalFileName;
 
   while (!completed && Date.now() - pollStart < maxWaitMs) {
     await new Promise((r) => setTimeout(r, 500));
@@ -534,6 +566,14 @@ export async function downloadPass1ToWebAppCache(
     }
 
     const st = await statusRes.json();
+    if (st.fileName && typeof st.fileName === 'string' && st.fileName.trim()) {
+      resolvedFileName = formatDownloadedFilename(
+        st.fileName.trim(),
+        downloadPayload.title,
+        downloadPayload.volume,
+        ext
+      );
+    }
     const estimatedTotal = st.totalBytes > 0 ? st.totalBytes : (downloadPayload.size || 38 * 1024 * 1024);
 
     if (onProgress) {
@@ -567,10 +607,10 @@ export async function downloadPass1ToWebAppCache(
     );
   }
 
-  const cachedUrl = `/api/download/cached-file?jobId=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(finalFileName)}`;
+  const cachedUrl = `/api/download/cached-file?jobId=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(resolvedFileName)}`;
   return {
     jobId,
-    fileName: finalFileName,
+    fileName: resolvedFileName,
     size: finalBytes,
     cachedUrl,
     isSim,
