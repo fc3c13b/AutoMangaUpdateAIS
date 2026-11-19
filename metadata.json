@@ -1,0 +1,8 @@
+{
+  "name": "AutoMangaUpdate3",
+  "description": "連載漫画の更新チェック・既読話数管理・配信スケジュールを一元管理する自動化トラッカー",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

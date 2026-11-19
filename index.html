@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ja" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AutoMangaUpdate2 - マンガフォルダ自動更新＆巻数チェッカー</title>
+    <meta name="description" content="ローカルマンガフォルダ（M:\MangaS\Manga等）をスキャンし、最大巻数を検出してDL-RAW等のソースから新刊を自動検索・ダウンロード・自動保存するツール" />
+    <meta property="og:title" content="AutoMangaUpdate2 - マンガフォルダ自動更新＆巻数チェッカー" />
+    <meta property="og:description" content="ローカルマンガフォルダ（M:\MangaS\Manga等）をスキャンし、最大巻数を検出してDL-RAW等のソースから新刊を自動検索・ダウンロード・自動保存するツール" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <script>
+      // AI Studio環境におけるVite HMR/WebSocket切断エラーの伝播を抑止
+      window.addEventListener('error', function(e) {
+        var msg = e && (e.message || (e.error && e.error.message) || '');
+        if (msg && (msg.indexOf('WebSocket') !== -1 || msg.indexOf('@vite/client') !== -1 || msg.indexOf('createWebSocketModuleRunnerTransport') !== -1)) {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+        }
+      }, true);
+      window.addEventListener('unhandledrejection', function(e) {
+        var reason = e && (e.reason && (e.reason.message || String(e.reason))) || '';
+        if (reason && (reason.indexOf('WebSocket') !== -1 || reason.indexOf('@vite/client') !== -1 || reason.indexOf('createWebSocketModuleRunnerTransport') !== -1)) {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+        }
+      }, true);
+    </script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 font-sans antialiased selection:bg-indigo-500 selection:text-white min-h-screen">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
